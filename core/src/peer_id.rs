@@ -57,8 +57,6 @@ impl PeerId {
     /// Builds a `PeerId` from a public key.
     #[inline]
     pub fn from_public_key(key: PublicKey) -> PeerId {
-        let key_enc = key.into_protobuf_encoding();
-
         // Note: the correct behaviour, according to the libp2p specifications, is the
         // commented-out code, which consists it transmitting small keys un-hashed. However, this
         // version and all previous versions of rust-libp2p always hash the key. Starting from
@@ -72,9 +70,14 @@ impl PeerId {
         } else {
             multihash::Hash::SHA2256
         };*/
-        let hash_algorithm = multihash::Hash::SHA2256;
-        let multihash = multihash::encode(hash_algorithm, &key_enc)
-            .expect("identity and sha2-256 are always supported by known public key types");
+        let key_enc = match key {
+            PublicKey::Ed25519(pub_key) => {
+                Some(pub_key.encode().to_vec())
+            }
+            _ => { None }
+        };
+        let multihash = multihash::encode(multihash::Hash::SHA3256, &key_enc.unwrap())
+            .expect("sha3-256 is always supported");
         PeerId { multihash }
     }
 
@@ -84,7 +87,7 @@ impl PeerId {
     pub fn from_bytes(data: Vec<u8>) -> Result<PeerId, Vec<u8>> {
         match multihash::Multihash::from_bytes(data) {
             Ok(multihash) => {
-                if multihash.algorithm() == multihash::Hash::SHA2256
+                if multihash.algorithm() == multihash::Hash::SHA3256
                     || multihash.algorithm() == multihash::Hash::Identity
                 {
                     Ok(PeerId { multihash })
@@ -100,7 +103,7 @@ impl PeerId {
     /// returns back the data as an error.
     #[inline]
     pub fn from_multihash(data: multihash::Multihash) -> Result<PeerId, multihash::Multihash> {
-        if data.algorithm() == multihash::Hash::SHA2256 || data.algorithm() == multihash::Hash::Identity {
+        if data.algorithm() == multihash::Hash::SHA3256 || data.algorithm() == multihash::Hash::Identity {
             Ok(PeerId { multihash: data })
         } else {
             Err(data)
@@ -113,7 +116,7 @@ impl PeerId {
     #[inline]
     pub fn random() -> PeerId {
         PeerId {
-            multihash: multihash::Multihash::random(multihash::Hash::SHA2256)
+            multihash: multihash::Multihash::random(multihash::Hash::SHA3256)
         }
     }
 
@@ -269,7 +272,7 @@ mod tests {
 
     #[test]
     fn random_peer_id_is_valid() {
-        for _ in 0 .. 5000 {
+        for _ in 0..5000 {
             let peer_id = PeerId::random();
             assert_eq!(peer_id, PeerId::from_bytes(peer_id.clone().into_bytes()).unwrap());
         }
