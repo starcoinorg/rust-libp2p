@@ -82,8 +82,9 @@ impl PeerId {
             _ => { None }
         };
 
+        let canonical_algorithm = None;
         let canonical = canonical_algorithm.map(|alg|
-            multihash::encode(alg, &key_enc).expect("SHA2256 is always supported"));
+            multihash::encode(alg, &key_enc.clone().unwrap()).expect("SHA2256 is always supported"));
 
         let multihash = multihash::encode(multihash::Hash::SHA3256, &key_enc.unwrap())
             .expect("sha3-256 is always supported");
@@ -123,7 +124,7 @@ impl PeerId {
     /// This is useful for randomly walking on a DHT, or for testing purposes.
     pub fn random() -> PeerId {
         PeerId {
-            multihash: multihash::Multihash::random(multihash::Hash::SHA3256)
+            multihash: multihash::Multihash::random(multihash::Hash::SHA3256),
             canonical: None,
         }
     }
