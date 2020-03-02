@@ -26,7 +26,8 @@ use quote::quote;
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, DeriveInput, Data, DataStruct, Ident};
 
-/// The interface that satisfies Rust.
+/// Generates a delegating `NetworkBehaviour` implementation for the struct this is used for. See
+/// the trait documentation for better description.
 #[proc_macro_derive(NetworkBehaviour, attributes(behaviour))]
 pub fn hello_macro_derive(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
@@ -58,17 +59,6 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
     let connected_point = quote!{::libp2p::core::ConnectedPoint};
     let listener_id = quote!{::libp2p::core::nodes::ListenerId};
 
-    // Name of the type parameter that represents the substream.
-    let substream_generic = {
-        let mut n = "TSubstream".to_string();
-        // Avoid collisions.
-        while ast.generics.type_params().any(|tp| tp.ident == n) {
-            n.push('1');
-        }
-        let n = Ident::new(&n, name.span());
-        quote!{#n}
-    };
-
     let poll_parameters = quote!{::libp2p::swarm::PollParameters};
 
     // Build the generics.
@@ -76,28 +66,21 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
         let tp = ast.generics.type_params();
         let lf = ast.generics.lifetimes();
         let cst = ast.generics.const_params();
-        quote!{<#(#lf,)* #(#tp,)* #(#cst,)* #substream_generic>}
+        quote!{<#(#lf,)* #(#tp,)* #(#cst,)*>}
     };
 
     // Build the `where ...` clause of the trait implementation.
     let where_clause = {
-        let mut additional = data_struct.fields.iter()
+        let additional = data_struct.fields.iter()
             .filter(|x| !is_ignored(x))
             .flat_map(|field| {
                 let ty = &field.ty;
                 vec![
                     quote!{#ty: #trait_to_impl},
                     quote!{Self: #net_behv_event_proc<<#ty as #trait_to_impl>::OutEvent>},
-                    quote!{<<#ty as #trait_to_impl>::ProtocolsHandler as #into_protocols_handler>::Handler: #protocols_handler<Substream = #substream_generic>},
-                    // Note: this bound is required because of https://github.com/rust-lang/rust/issues/55697
-                    quote!{<<<#ty as #trait_to_impl>::ProtocolsHandler as #into_protocols_handler>::Handler as #protocols_handler>::InboundProtocol: ::libp2p::core::InboundUpgrade<#substream_generic>},
-                    quote!{<<<#ty as #trait_to_impl>::ProtocolsHandler as #into_protocols_handler>::Handler as #protocols_handler>::OutboundProtocol: ::libp2p::core::OutboundUpgrade<#substream_generic>},
                 ]
             })
             .collect::<Vec<_>>();
-
-        additional.push(quote!{#substream_generic: ::libp2p::tokio_io::AsyncRead});
-        additional.push(quote!{#substream_generic: ::libp2p::tokio_io::AsyncWrite});
 
         if let Some(where_clause) = where_clause {
             if where_clause.predicates.trailing_punct() {
@@ -381,14 +364,14 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
     // If we find a `#[behaviour(poll_method = "poll")]` attribute on the struct, we call
     // `self.poll()` at the end of the polling.
     let poll_method = {
-        let mut poll_method = quote!{Async::NotReady};
+        let mut poll_method = quote!{std::task::Poll::Pending};
         for meta_items in ast.attrs.iter().filter_map(get_meta_items) {
             for meta_item in meta_items {
                 match meta_item {
                     syn::NestedMeta::Meta(syn::Meta::NameValue(ref m)) if m.path.is_ident("poll_method") => {
                         if let syn::Lit::Str(ref s) = m.lit {
                             let ident: Ident = syn::parse_str(&s.value()).unwrap();
-                            poll_method = quote!{#name::#ident(self)};
+                            poll_method = quote!{#name::#ident(self, cx, poll_params)};
                         }
                     }
                     _ => ()
@@ -418,26 +401,26 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
 
         Some(quote!{
             loop {
-                match #field_name.poll(poll_params) {
-                    Async::Ready(#network_behaviour_action::GenerateEvent(event)) => {
+                match #field_name.poll(cx, poll_params) {
+                    std::task::Poll::Ready(#network_behaviour_action::GenerateEvent(event)) => {
                         #net_behv_event_proc::inject_event(self, event)
                     }
-                    Async::Ready(#network_behaviour_action::DialAddress { address }) => {
-                        return Async::Ready(#network_behaviour_action::DialAddress { address });
+                    std::task::Poll::Ready(#network_behaviour_action::DialAddress { address }) => {
+                        return std::task::Poll::Ready(#network_behaviour_action::DialAddress { address });
                     }
-                    Async::Ready(#network_behaviour_action::DialPeer { peer_id }) => {
-                        return Async::Ready(#network_behaviour_action::DialPeer { peer_id });
+                    std::task::Poll::Ready(#network_behaviour_action::DialPeer { peer_id }) => {
+                        return std::task::Poll::Ready(#network_behaviour_action::DialPeer { peer_id });
                     }
-                    Async::Ready(#network_behaviour_action::SendEvent { peer_id, event }) => {
-                        return Async::Ready(#network_behaviour_action::SendEvent {
+                    std::task::Poll::Ready(#network_behaviour_action::SendEvent { peer_id, event }) => {
+                        return std::task::Poll::Ready(#network_behaviour_action::SendEvent {
                             peer_id,
                             event: #wrapped_event,
                         });
                     }
-                    Async::Ready(#network_behaviour_action::ReportObservedAddr { address }) => {
-                        return Async::Ready(#network_behaviour_action::ReportObservedAddr { address });
+                    std::task::Poll::Ready(#network_behaviour_action::ReportObservedAddr { address }) => {
+                        return std::task::Poll::Ready(#network_behaviour_action::ReportObservedAddr { address });
                     }
-                    Async::NotReady => break,
+                    std::task::Poll::Pending => break,
                 }
             }
         })
@@ -512,10 +495,10 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
                 }
             }
 
-            fn poll(&mut self, poll_params: &mut impl #poll_parameters) -> ::libp2p::futures::Async<#network_behaviour_action<<<Self::ProtocolsHandler as #into_protocols_handler>::Handler as #protocols_handler>::InEvent, Self::OutEvent>> {
+            fn poll(&mut self, cx: &mut std::task::Context, poll_params: &mut impl #poll_parameters) -> std::task::Poll<#network_behaviour_action<<<Self::ProtocolsHandler as #into_protocols_handler>::Handler as #protocols_handler>::InEvent, Self::OutEvent>> {
                 use libp2p::futures::prelude::*;
                 #(#poll_stmts)*
-                let f: ::libp2p::futures::Async<#network_behaviour_action<<<Self::ProtocolsHandler as #into_protocols_handler>::Handler as #protocols_handler>::InEvent, Self::OutEvent>> = #poll_method;
+                let f: std::task::Poll<#network_behaviour_action<<<Self::ProtocolsHandler as #into_protocols_handler>::Handler as #protocols_handler>::InEvent, Self::OutEvent>> = #poll_method;
                 f
             }
         }
@@ -525,10 +508,12 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
 }
 
 fn get_meta_items(attr: &syn::Attribute) -> Option<Vec<syn::NestedMeta>> {
-    if attr.path.is_ident("behaviour") {
+    if attr.path.segments.len() == 1 && attr.path.segments[0].ident == "behaviour" {
         match attr.parse_meta() {
             Ok(syn::Meta::List(ref meta)) => Some(meta.nested.iter().cloned().collect()),
-            _ => {
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("error parsing attribute metadata: {}", e);
                 None
             }
         }

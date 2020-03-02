@@ -20,23 +20,26 @@
 
 use crate::PublicKey;
 use bs58;
-use quick_error::quick_error;
+use thiserror::Error;
 use multihash;
-use std::{convert::TryFrom, fmt, str::FromStr};
+use std::{convert::TryFrom, borrow::Borrow, fmt, hash, str::FromStr};
 
 /// Public keys with byte-lengths smaller than `MAX_INLINE_KEY_LENGTH` will be
 /// automatically used as the peer id using an identity multihash.
-//
-// Note: see `from_public_key` for how this value will be used in the future.
-const MAX_INLINE_KEY_LENGTH: usize = 42;
+const _MAX_INLINE_KEY_LENGTH: usize = 42;
 
 /// Identifier of a peer of the network.
 ///
 /// The data is a multihash of the public key of the peer.
 // TODO: maybe keep things in decoded version?
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Eq)]
 pub struct PeerId {
     multihash: multihash::Multihash,
+    /// A (temporary) "canonical" multihash if `multihash` is of type
+    /// multihash::Hash::Identity, so that `Borrow<[u8]>` semantics
+    /// can be given, i.e. a view of a byte representation whose
+    /// equality is consistent with `PartialEq`.
+    canonical: Option<multihash::Multihash>,
 }
 
 impl fmt::Debug for PeerId {
@@ -55,8 +58,9 @@ impl fmt::Display for PeerId {
 
 impl PeerId {
     /// Builds a `PeerId` from a public key.
-    #[inline]
     pub fn from_public_key(key: PublicKey) -> PeerId {
+        //let key_enc = key.into_protobuf_encoding();
+
         // Note: the correct behaviour, according to the libp2p specifications, is the
         // commented-out code, which consists it transmitting small keys un-hashed. However, this
         // version and all previous versions of rust-libp2p always hash the key. Starting from
@@ -70,27 +74,32 @@ impl PeerId {
         } else {
             multihash::Hash::SHA2256
         };*/
+
         let key_enc = match key {
             PublicKey::Ed25519(pub_key) => {
                 Some(pub_key.encode().to_vec())
             }
             _ => { None }
         };
+
+        let canonical = canonical_algorithm.map(|alg|
+            multihash::encode(alg, &key_enc).expect("SHA2256 is always supported"));
+
         let multihash = multihash::encode(multihash::Hash::SHA3256, &key_enc.unwrap())
             .expect("sha3-256 is always supported");
-        PeerId { multihash }
+        PeerId { multihash,canonical }
+
     }
 
     /// Checks whether `data` is a valid `PeerId`. If so, returns the `PeerId`. If not, returns
     /// back the data as an error.
-    #[inline]
     pub fn from_bytes(data: Vec<u8>) -> Result<PeerId, Vec<u8>> {
         match multihash::Multihash::from_bytes(data) {
             Ok(multihash) => {
                 if multihash.algorithm() == multihash::Hash::SHA3256
                     || multihash.algorithm() == multihash::Hash::Identity
                 {
-                    Ok(PeerId { multihash })
+                    Ok(PeerId { multihash,canonical:None })
                 } else {
                     Err(multihash.into_bytes())
                 }
@@ -101,10 +110,9 @@ impl PeerId {
 
     /// Turns a `Multihash` into a `PeerId`. If the multihash doesn't use the correct algorithm,
     /// returns back the data as an error.
-    #[inline]
     pub fn from_multihash(data: multihash::Multihash) -> Result<PeerId, multihash::Multihash> {
         if data.algorithm() == multihash::Hash::SHA3256 || data.algorithm() == multihash::Hash::Identity {
-            Ok(PeerId { multihash: data })
+            Ok(PeerId { multihash: data, canonical: None })
         } else {
             Err(data)
         }
@@ -113,39 +121,34 @@ impl PeerId {
     /// Generates a random peer ID from a cryptographically secure PRNG.
     ///
     /// This is useful for randomly walking on a DHT, or for testing purposes.
-    #[inline]
     pub fn random() -> PeerId {
         PeerId {
             multihash: multihash::Multihash::random(multihash::Hash::SHA3256)
+            canonical: None,
         }
     }
 
     /// Returns a raw bytes representation of this `PeerId`.
     ///
-    /// Note that this is not the same as the public key of the peer.
-    #[inline]
+    /// **NOTE:** This byte representation is not necessarily consistent with
+    /// equality of peer IDs. That is, two peer IDs may be considered equal
+    /// while having a different byte representation as per `into_bytes`.
     pub fn into_bytes(self) -> Vec<u8> {
         self.multihash.into_bytes()
     }
 
     /// Returns a raw bytes representation of this `PeerId`.
     ///
-    /// Note that this is not the same as the public key of the peer.
-    #[inline]
+    /// **NOTE:** This byte representation is not necessarily consistent with
+    /// equality of peer IDs. That is, two peer IDs may be considered equal
+    /// while having a different byte representation as per `as_bytes`.
     pub fn as_bytes(&self) -> &[u8] {
         self.multihash.as_bytes()
     }
 
     /// Returns a base-58 encoded string of this `PeerId`.
-    #[inline]
     pub fn to_base58(&self) -> String {
-        bs58::encode(self.multihash.as_bytes()).into_string()
-    }
-
-    /// Returns the raw bytes of the hash of this `PeerId`.
-    #[inline]
-    pub fn digest(&self) -> &[u8] {
-        self.multihash.digest()
+        bs58::encode(self.borrow() as &[u8]).into_string()
     }
 
     /// Checks whether the public key passed as parameter matches the public key of this `PeerId`.
@@ -160,6 +163,16 @@ impl PeerId {
             Err(multihash::EncodeError::UnsupportedType) => None,
             Err(multihash::EncodeError::UnsupportedInputLength) => None,
         }
+    }
+}
+
+impl hash::Hash for PeerId {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: hash::Hasher
+    {
+        let digest = self.borrow() as &[u8];
+        hash::Hash::hash(digest, state)
     }
 }
 
@@ -186,53 +199,41 @@ impl TryFrom<multihash::Multihash> for PeerId {
     }
 }
 
-impl PartialEq<multihash::Multihash> for PeerId {
-    #[inline]
-    fn eq(&self, other: &multihash::Multihash) -> bool {
-        &self.multihash == other
-    }
-}
-
-impl PartialEq<PeerId> for multihash::Multihash {
-    #[inline]
+impl PartialEq<PeerId> for PeerId {
     fn eq(&self, other: &PeerId) -> bool {
-        self == &other.multihash
+        let self_digest = self.borrow() as &[u8];
+        let other_digest = other.borrow() as &[u8];
+        self_digest == other_digest
     }
 }
 
-impl AsRef<multihash::Multihash> for PeerId {
-    #[inline]
-    fn as_ref(&self) -> &multihash::Multihash {
-        &self.multihash
+impl Borrow<[u8]> for PeerId {
+    fn borrow(&self) -> &[u8] {
+        self.canonical.as_ref().map_or(self.multihash.as_bytes(), |c| c.as_bytes())
     }
 }
 
+/// **NOTE:** This byte representation is not necessarily consistent with
+/// equality of peer IDs. That is, two peer IDs may be considered equal
+/// while having a different byte representation as per `AsRef<[u8]>`.
 impl AsRef<[u8]> for PeerId {
-    #[inline]
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
     }
 }
 
-impl Into<multihash::Multihash> for PeerId {
-    #[inline]
-    fn into(self) -> multihash::Multihash {
-        self.multihash
+impl From<PeerId> for multihash::Multihash {
+    fn from(peer_id: PeerId) -> Self {
+        peer_id.multihash
     }
 }
 
-quick_error! {
-    #[derive(Debug)]
-    pub enum ParseError {
-        B58(e: bs58::decode::Error) {
-            display("base-58 decode error: {}", e)
-            cause(e)
-            from()
-        }
-        MultiHash {
-            display("decoding multihash failed")
-        }
-    }
+#[derive(Debug, Error)]
+pub enum ParseError {
+    #[error("base-58 decode error: {0}")]
+    B58(#[from] bs58::decode::Error),
+    #[error("decoding multihash failed")]
+    MultiHash,
 }
 
 impl FromStr for PeerId {
@@ -248,6 +249,7 @@ impl FromStr for PeerId {
 #[cfg(test)]
 mod tests {
     use crate::{PeerId, identity};
+    use std::{convert::TryFrom as _, hash::{self, Hasher as _}};
 
     #[test]
     fn peer_id_is_public_key() {
@@ -276,5 +278,63 @@ mod tests {
             let peer_id = PeerId::random();
             assert_eq!(peer_id, PeerId::from_bytes(peer_id.clone().into_bytes()).unwrap());
         }
+    }
+
+    #[test]
+    fn peer_id_identity_equal_to_sha2256() {
+        let random_bytes = (0..64).map(|_| rand::random::<u8>()).collect::<Vec<u8>>();
+        let mh1 = multihash::encode(multihash::Hash::SHA2256, &random_bytes).unwrap();
+        let mh2 = multihash::encode(multihash::Hash::Identity, &random_bytes).unwrap();
+        let peer_id1 = PeerId::try_from(mh1).unwrap();
+        let peer_id2 = PeerId::try_from(mh2).unwrap();
+        assert_eq!(peer_id1, peer_id2);
+        assert_eq!(peer_id2, peer_id1);
+    }
+
+    #[test]
+    fn peer_id_identity_hashes_equal_to_sha2256() {
+        let random_bytes = (0..64).map(|_| rand::random::<u8>()).collect::<Vec<u8>>();
+        let mh1 = multihash::encode(multihash::Hash::SHA2256, &random_bytes).unwrap();
+        let mh2 = multihash::encode(multihash::Hash::Identity, &random_bytes).unwrap();
+        let peer_id1 = PeerId::try_from(mh1).unwrap();
+        let peer_id2 = PeerId::try_from(mh2).unwrap();
+
+        let mut hasher1 = fnv::FnvHasher::with_key(0);
+        hash::Hash::hash(&peer_id1, &mut hasher1);
+        let mut hasher2 = fnv::FnvHasher::with_key(0);
+        hash::Hash::hash(&peer_id2, &mut hasher2);
+
+        assert_eq!(hasher1.finish(), hasher2.finish());
+    }
+
+    #[test]
+    fn peer_id_equal_across_algorithms() {
+        use multihash::Hash;
+        use quickcheck::{Arbitrary, Gen};
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct HashAlgo(Hash);
+
+        impl Arbitrary for HashAlgo {
+            fn arbitrary<G: Gen>(g: &mut G) -> Self {
+                match g.next_u32() % 4 { // make Hash::Identity more likely
+                    0 => HashAlgo(Hash::SHA2256),
+                    _ => HashAlgo(Hash::Identity)
+                }
+            }
+        }
+
+        fn property(data: Vec<u8>, algo1: HashAlgo, algo2: HashAlgo) -> bool {
+            let a = PeerId::try_from(multihash::encode(algo1.0, &data).unwrap()).unwrap();
+            let b = PeerId::try_from(multihash::encode(algo2.0, &data).unwrap()).unwrap();
+
+            if algo1 == algo2 || algo1.0 == Hash::Identity || algo2.0 == Hash::Identity {
+                a == b
+            } else {
+                a != b
+            }
+        }
+
+        quickcheck::quickcheck(property as fn(Vec<u8>, HashAlgo, HashAlgo) -> bool)
     }
 }

@@ -31,19 +31,18 @@ use crate::protocol::{KadConnectionType, KadPeer};
 use crate::query::{Query, QueryId, QueryPool, QueryConfig, QueryPoolState};
 use crate::record::{self, store::{self, RecordStore}, Record, ProviderRecord};
 use fnv::{FnvHashMap, FnvHashSet};
-use futures::prelude::*;
 use libp2p_core::{ConnectedPoint, Multiaddr, PeerId};
 use libp2p_swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters, ProtocolsHandler};
 use log::{info, debug, warn};
 use smallvec::SmallVec;
-use std::{borrow::Cow, error, iter, marker::PhantomData, time::Duration};
+use std::{borrow::{Borrow, Cow}, error, iter, time::Duration};
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use tokio_io::{AsyncRead, AsyncWrite};
+use std::task::{Context, Poll};
 use wasm_timer::Instant;
 
 /// Network behaviour that handles Kademlia.
-pub struct Kademlia<TSubstream, TStore> {
+pub struct Kademlia<TStore> {
     /// The Kademlia routing table.
     kbuckets: KBucketsTable<kbucket::Key<PeerId>, Addresses>,
 
@@ -74,9 +73,6 @@ pub struct Kademlia<TSubstream, TStore> {
 
     /// Queued events to return when the behaviour is being polled.
     queued_events: VecDeque<NetworkBehaviourAction<KademliaHandlerIn<QueryId>, KademliaEvent>>,
-
-    /// Marker to pin the generics.
-    marker: PhantomData<TSubstream>,
 
     /// The record storage.
     store: TStore,
@@ -217,7 +213,7 @@ impl KademliaConfig {
     }
 }
 
-impl<TSubstream, TStore> Kademlia<TSubstream, TStore>
+impl<TStore> Kademlia<TStore>
 where
     for<'a> TStore: RecordStore<'a>
 {
@@ -255,7 +251,6 @@ where
             put_record_job,
             record_ttl: config.record_ttl,
             provider_record_ttl: config.provider_record_ttl,
-            marker: PhantomData,
         }
     }
 
@@ -336,10 +331,9 @@ where
     /// The result of this operation is delivered in [`KademliaEvent::GetClosestPeersResult`].
     pub fn get_closest_peers<K>(&mut self, key: K)
     where
-        K: AsRef<[u8]> + Clone
+        K: Borrow<[u8]> + Clone
     {
-        let key = key.as_ref().to_vec();
-        let info = QueryInfo::GetClosestPeers { key: key.clone() };
+        let info = QueryInfo::GetClosestPeers { key: key.borrow().to_vec() };
         let target = kbucket::Key::new(key);
         let peers = self.kbuckets.closest_keys(&target);
         let inner = QueryInner::new(info);
@@ -476,7 +470,7 @@ where
     /// of the libp2p Kademlia provider API.
     ///
     /// The results of the (repeated) provider announcements sent by this node are
-    /// delivered in [`KademliaEvent::AddProviderResult`].
+    /// delivered in [`AddProviderResult`].
     pub fn start_providing(&mut self, key: record::Key) {
         let record = ProviderRecord::new(key.clone(), self.kbuckets.local_key().preimage().clone());
         if let Err(err) = self.store.add_provider(record) {
@@ -536,9 +530,12 @@ where
         }
 
         if let Some(query) = self.queries.get_mut(query_id) {
+            log::trace!("Request to {:?} in query {:?} succeeded.", source, query_id);
             for peer in others_iter.clone() {
-                query.inner.addresses
-                    .insert(peer.node_id.clone(), peer.multiaddrs.iter().cloned().collect());
+                log::trace!("Peer {:?} reported by {:?} in query {:?}.",
+                            peer, source, query_id);
+                let addrs = peer.multiaddrs.iter().cloned().collect();
+                query.inner.addresses.insert(peer.node_id.clone(), addrs);
             }
             query.on_success(source, others_iter.cloned().map(|kp| kp.node_id))
         }
@@ -665,6 +662,7 @@ where
     fn query_finished(&mut self, q: Query<QueryInner>, params: &mut impl PollParameters)
         -> Option<KademliaEvent>
     {
+        log::trace!("Query {:?} finished.", q.id());
         let result = q.into_result();
         match result.inner.info {
             QueryInfo::Bootstrap { peer } => {
@@ -817,6 +815,7 @@ where
 
     /// Handles a query that timed out.
     fn query_timeout(&self, query: Query<QueryInner>) -> Option<KademliaEvent> {
+        log::trace!("Query {:?} timed out.", query.id());
         let result = query.into_result();
         match result.inner.info {
             QueryInfo::Bootstrap { peer } =>
@@ -843,12 +842,13 @@ where
                             AddProviderError::Timeout { key })),
                 }),
 
-            QueryInfo::GetClosestPeers { key } =>
+            QueryInfo::GetClosestPeers { key } => {
                 Some(KademliaEvent::GetClosestPeersResult(Err(
                     GetClosestPeersError::Timeout {
                         key,
                         peers: result.peers.collect()
-                    }))),
+                    })))
+            },
 
             QueryInfo::PreparePutRecord { record, quorum, context, .. } => {
                 let err = Err(PutRecordError::Timeout {
@@ -1008,12 +1008,12 @@ where
     }
 }
 
-impl<TSubstream, TStore> NetworkBehaviour for Kademlia<TSubstream, TStore>
+impl<TStore> NetworkBehaviour for Kademlia<TStore>
 where
-    TSubstream: AsyncRead + AsyncWrite,
     for<'a> TStore: RecordStore<'a>,
+    TStore: Send + 'static,
 {
-    type ProtocolsHandler = KademliaHandler<TSubstream, QueryId>;
+    type ProtocolsHandler = KademliaHandler<QueryId>;
     type OutEvent = KademliaEvent;
 
     fn new_handler(&mut self) -> Self::ProtocolsHandler {
@@ -1105,7 +1105,7 @@ where
             }
 
             for query in self.queries.iter_mut() {
-                if let Some(addrs) = query.inner.addresses.get_mut(&peer_id) {
+                if let Some(addrs) = query.inner.addresses.get_mut(peer_id) {
                     addrs.retain(|a| a != addr);
                 }
             }
@@ -1195,9 +1195,11 @@ where
                 }
             }
 
-            KademliaHandlerEvent::QueryError { user_data, .. } => {
-                // It is possible that we obtain a response for a query that has finished, which is
-                // why we may not find an entry in `self.queries`.
+            KademliaHandlerEvent::QueryError { user_data, error } => {
+                log::debug!("Request to {:?} in query {:?} failed with {:?}",
+                            source, user_data, error);
+                // If the query to which the error relates is still active,
+                // signal the failure w.r.t. `source`.
                 if let Some(query) = self.queries.get_mut(&user_data) {
                     query.on_failure(&source)
                 }
@@ -1304,7 +1306,7 @@ where
         };
     }
 
-    fn poll(&mut self, parameters: &mut impl PollParameters) -> Async<
+    fn poll(&mut self, cx: &mut Context, parameters: &mut impl PollParameters) -> Poll<
         NetworkBehaviourAction<
             <Self::ProtocolsHandler as ProtocolsHandler>::InEvent,
             Self::OutEvent,
@@ -1319,7 +1321,7 @@ where
         if let Some(mut job) = self.add_provider_job.take() {
             let num = usize::min(JOBS_MAX_NEW_QUERIES, jobs_query_capacity);
             for _ in 0 .. num {
-                if let Async::Ready(r) = job.poll(&mut self.store, now) {
+                if let Poll::Ready(r) = job.poll(cx, &mut self.store, now) {
                     self.start_add_provider(r.key, AddProviderContext::Republish)
                 } else {
                     break
@@ -1333,7 +1335,7 @@ where
         if let Some(mut job) = self.put_record_job.take() {
             let num = usize::min(JOBS_MAX_NEW_QUERIES, jobs_query_capacity);
             for _ in 0 .. num {
-                if let Async::Ready(r) = job.poll(&mut self.store, now) {
+                if let Poll::Ready(r) = job.poll(cx, &mut self.store, now) {
                     let context = if r.publisher.as_ref() == Some(self.kbuckets.local_key().preimage()) {
                         PutRecordContext::Republish
                     } else {
@@ -1350,7 +1352,7 @@ where
         loop {
             // Drain queued events first.
             if let Some(event) = self.queued_events.pop_front() {
-                return Async::Ready(event);
+                return Poll::Ready(event);
             }
 
             // Drain applied pending entries from the routing table.
@@ -1361,7 +1363,7 @@ where
                     addresses: value,
                     old_peer: entry.evicted.map(|n| n.key.into_preimage())
                 };
-                return Async::Ready(NetworkBehaviourAction::GenerateEvent(event))
+                return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event))
             }
 
             // Look for a finished query.
@@ -1369,12 +1371,12 @@ where
                 match self.queries.poll(now) {
                     QueryPoolState::Finished(q) => {
                         if let Some(event) = self.query_finished(q, parameters) {
-                            return Async::Ready(NetworkBehaviourAction::GenerateEvent(event))
+                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event))
                         }
                     }
                     QueryPoolState::Timeout(q) => {
                         if let Some(event) = self.query_timeout(q) {
-                            return Async::Ready(NetworkBehaviourAction::GenerateEvent(event))
+                            return Poll::Ready(NetworkBehaviourAction::GenerateEvent(event))
                         }
                     }
                     QueryPoolState::Waiting(Some((query, peer_id))) => {
@@ -1406,7 +1408,7 @@ where
             // If no new events have been queued either, signal `NotReady` to
             // be polled again later.
             if self.queued_events.is_empty() {
-                return Async::NotReady
+                return Poll::Pending
             }
         }
     }
@@ -1440,7 +1442,7 @@ impl Quorum {
 
 /// The events produced by the `Kademlia` behaviour.
 ///
-/// See [`Kademlia::poll`].
+/// See [`NetworkBehaviour::poll`].
 #[derive(Debug)]
 pub enum KademliaEvent {
     /// The result of [`Kademlia::bootstrap`].

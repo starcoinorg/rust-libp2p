@@ -25,6 +25,7 @@ pub mod store;
 use bytes::Bytes;
 use libp2p_core::PeerId;
 use multihash::Multihash;
+use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 use wasm_timer::Instant;
 
@@ -35,12 +36,18 @@ pub struct Key(Bytes);
 impl Key {
     /// Creates a new key from the bytes of the input.
     pub fn new<K: AsRef<[u8]>>(key: &K) -> Self {
-        Key(Bytes::from(key.as_ref()))
+        Key(Bytes::copy_from_slice(key.as_ref()))
     }
 
     /// Copies the bytes of the key into a new vector.
     pub fn to_vec(&self) -> Vec<u8> {
         Vec::from(&self.0[..])
+    }
+}
+
+impl Borrow<[u8]> for Key {
+    fn borrow(&self) -> &[u8] {
+        &self.0[..]
     }
 }
 

@@ -18,7 +18,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{Bytes, BytesMut, Buf, BufMut};
 use futures::{try_ready, Async, Poll, Sink, StartSend, Stream, AsyncSink};
 use std::{io, u16};
 use tokio_io::{AsyncRead, AsyncWrite};
@@ -136,7 +136,7 @@ impl<R> LengthDelimited<R> {
                     "Failed to write buffered frame."))
             }
 
-            self.write_buffer.split_to(n);
+            self.write_buffer.advance(n);
         }
 
         Ok(Async::Ready(()))
@@ -284,10 +284,10 @@ impl<R> LengthDelimitedReader<R> {
     /// # Panic
     ///
     /// Will panic if called while there is data in the read or write buffer.
-    /// The read buffer is guaranteed to be empty whenever `Stream::poll` yields
+    /// The read buffer is guaranteed to be empty whenever [`Stream::poll`] yields
     /// a new `Message`. The write buffer is guaranteed to be empty whenever
-    /// [`poll_write_buffer`] yields `Async::Ready` or after the `Sink` has been
-    /// completely flushed via [`Sink::poll_complete`].
+    /// [`LengthDelimited::poll_write_buffer`] yields [`Async::Ready`] or after
+    /// the [`Sink`] has been completely flushed via [`Sink::poll_complete`].
     pub fn into_inner(self) -> (R, BytesMut) {
         self.inner.into_inner()
     }
