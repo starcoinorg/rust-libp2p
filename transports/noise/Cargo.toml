@@ -20,7 +20,7 @@ rand = "0.8.3"
 sha2 = "0.10.0"
 static_assertions = "1"
 thiserror = "1.0.37"
-x25519-dalek = "1.1.0"
+x25519-dalek = "1.2.0"
 zeroize = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -40,7 +40,7 @@ ed25519-compact = "2.0.2"
 [build-dependencies]
 prost-build = "0.11"
 
-# Passing arguments to the docsrs builder in order to properly document cfg's. 
+# Passing arguments to the docsrs builder in order to properly document cfg's.
 # More information: https://docs.rs/about/builds#cross-compiling
 [package.metadata.docs.rs]
 all-features = true
